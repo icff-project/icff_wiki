@@ -50,6 +50,7 @@ import { CalloutBlock } from './tiptap-extensions/callout-block.js';
 import { IframeBlock } from './tiptap-extensions/iframe-block.js';
 import { WikiImage } from './tiptap-extensions/image-extension.js';
 import { WikiLink } from './tiptap-extensions/link-extension.js';
+import { PdfBlock } from './tiptap-extensions/pdf-block.js';
 import {
 	SlashCommands,
 	filterCommands,
@@ -127,6 +128,10 @@ async function uploadFile(file) {
 		const isImage = file.type.includes('image');
 		const result = await fileUploader.upload(file, {
 			private: false,
+			// Hit our handler directly (not via upload_file's `method` delegation,
+			// which would recurse). It converts PNG/JPEG to WebP when the Wiki
+			// Setting is enabled, returning the optimized file_url.
+			upload_endpoint: '/api/method/wiki.api.upload_wiki_asset',
 		});
 
 		toast.success(`${isImage ? 'Image' : 'File'} uploaded successfully`);
@@ -134,6 +139,125 @@ async function uploadFile(file) {
 	} catch (error) {
 		toast.error('Failed to upload file');
 		throw error;
+	}
+}
+
+/**
+ * Read a file into a base64 data URL for an instant local preview.
+ */
+function fileToBase64(file) {
+	return new Promise((resolve, reject) => {
+		const reader = new FileReader();
+		reader.onload = () => resolve(reader.result);
+		reader.onerror = reject;
+		reader.readAsDataURL(file);
+	});
+}
+
+/**
+ * Patch the attributes of the in-flight image node identified by uploadId.
+ */
+function updateImageNode(uploadId, attrs) {
+	const ed = editor.value;
+	if (!ed) return;
+	const { state, view } = ed;
+	let target = null;
+	state.doc.descendants((node, pos) => {
+		if (node.type.name === 'image' && node.attrs.uploadId === uploadId) {
+			target = { node, pos };
+			return false;
+		}
+	});
+	if (!target) return;
+	const tr = state.tr.setNodeMarkup(target.pos, undefined, {
+		...target.node.attrs,
+		...attrs,
+	});
+	view.dispatch(tr);
+}
+
+/**
+ * Insert an image immediately with a local preview + loading overlay, upload
+ * it in the background, then swap in the final URL (or surface an error).
+ */
+async function insertAndUploadImage(file) {
+	const ed = editor.value;
+	if (!ed) return;
+
+	const uploadId = `upload-${Date.now()}-${Math.random()
+		.toString(36)
+		.slice(2, 9)}`;
+
+	let preview = '';
+	try {
+		preview = await fileToBase64(file);
+	} catch {
+		preview = '';
+	}
+
+	ed.chain()
+		.focus()
+		.setImage({ src: preview, uploadId, loading: true })
+		.run();
+
+	try {
+		const url = await uploadFile(file);
+		updateImageNode(uploadId, { src: url, loading: false, error: null });
+	} catch (error) {
+		updateImageNode(uploadId, {
+			loading: false,
+			error: error?.message || 'Failed to upload image',
+		});
+	}
+}
+
+/**
+ * Patch the attributes of the in-flight PDF node identified by uploadId.
+ */
+function updatePdfNode(uploadId, attrs) {
+	const ed = editor.value;
+	if (!ed) return;
+	const { state, view } = ed;
+	let target = null;
+	state.doc.descendants((node, pos) => {
+		if (node.type.name === 'pdfBlock' && node.attrs.uploadId === uploadId) {
+			target = { node, pos };
+			return false;
+		}
+	});
+	if (!target) return;
+	const tr = state.tr.setNodeMarkup(target.pos, undefined, {
+		...target.node.attrs,
+		...attrs,
+	});
+	view.dispatch(tr);
+}
+
+/**
+ * Insert a PDF card immediately with a loading state, upload it in the
+ * background, then swap in the final URL (or surface an error).
+ */
+async function insertAndUploadPdf(file) {
+	const ed = editor.value;
+	if (!ed) return;
+
+	const uploadId = `upload-${Date.now()}-${Math.random()
+		.toString(36)
+		.slice(2, 9)}`;
+
+	ed.chain()
+		.focus()
+		.setPdf({ filename: file.name, uploadId, loading: true })
+		.run();
+
+	try {
+		const url = await uploadFile(file);
+		updatePdfNode(uploadId, { src: url, loading: false, error: null });
+	} catch (error) {
+		updatePdfNode(uploadId, {
+			loading: false,
+			error: error?.message || 'Failed to upload PDF',
+		});
 	}
 }
 
@@ -149,11 +273,7 @@ function handlePaste(_view, event) {
 			event.preventDefault();
 			const file = item.getAsFile();
 			if (file) {
-				uploadFile(file).then((url) => {
-					if (editor.value) {
-						editor.value.chain().focus().setImage({ src: url }).run();
-					}
-				});
+				insertAndUploadImage(file);
 			}
 			return true;
 		}
@@ -190,15 +310,16 @@ function handleDrop(_view, event) {
 	for (const file of files) {
 		const isImage = file.type.includes('image');
 		const isVideo = file.type.includes('video');
+		const isPdf =
+			file.type === 'application/pdf' ||
+			file.name?.toLowerCase().endsWith('.pdf');
 
 		if (isImage) {
-			uploadFile(file).then((url) => {
-				if (editor.value) {
-					editor.value.chain().focus().setImage({ src: url }).run();
-				}
-			});
+			insertAndUploadImage(file);
 		} else if (isVideo && editor.value) {
 			editor.value.commands.uploadVideo(file);
+		} else if (isPdf) {
+			insertAndUploadPdf(file);
 		}
 	}
 
@@ -206,17 +327,21 @@ function handleDrop(_view, event) {
 }
 
 /**
+ * Handle PDF upload events from the toolbar / slash command (which open a file
+ * picker and dispatch the chosen file through this custom event).
+ */
+function handlePdfUploadEvent(event) {
+	const file = event.detail?.file;
+	if (file) {
+		insertAndUploadPdf(file);
+	}
+}
+
+/**
  * Handle image upload from toolbar
  */
 async function handleImageUpload(file) {
-	try {
-		const url = await uploadFile(file);
-		if (editor.value) {
-			editor.value.chain().focus().setImage({ src: url }).run();
-		}
-	} catch (error) {
-		console.error('Failed to upload image:', error);
-	}
+	await insertAndUploadImage(file);
 }
 
 /**
@@ -473,6 +598,7 @@ function initEditor() {
 			// Custom extensions
 			CalloutBlock,
 			IframeBlock,
+			PdfBlock,
 			VideoBlock.configure({
 				uploadFunction: uploadFile,
 			}),
@@ -624,6 +750,8 @@ onMounted(() => {
 		'wiki-editor-upload-image',
 		handleSlashImageUploadEvent,
 	);
+	// Listen for PDF upload events (toolbar + slash command)
+	document.addEventListener('wiki-editor-upload-pdf', handlePdfUploadEvent);
 });
 
 onUnmounted(() => {
@@ -632,6 +760,7 @@ onUnmounted(() => {
 		'wiki-editor-upload-image',
 		handleSlashImageUploadEvent,
 	);
+	document.removeEventListener('wiki-editor-upload-pdf', handlePdfUploadEvent);
 	// Hide any open link popup
 	hideLinkPopup();
 	// Clean up window reference
