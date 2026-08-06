@@ -1,4 +1,6 @@
 import { expect, test } from '@playwright/test';
+import { APP_BASE, spaceLinkSelector } from '../helpers/routes';
+import { openNewPageDialog } from '../helpers/wiki';
 
 /**
  * Covers the iframe embed extension added for frappe/wiki#599.
@@ -16,6 +18,13 @@ const IFRAME_FIXTURE =
 
 const IFRAME_SRC =
 	'https://www.youtube.com/embed/QDia3e12czc?si=8or3Lz5IEeelsdcF';
+
+// What the same fixture becomes once it goes through normalizeEmbedUrl: the
+// privacy-enhanced host, share query intact. Only paths that normalize (the
+// URL input, a paste) produce this — markdown already stored on a page is
+// parsed as-is and keeps whichever host it was written with.
+const IFRAME_SRC_NORMALIZED =
+	'https://www.youtube-nocookie.com/embed/QDia3e12czc?si=8or3Lz5IEeelsdcF';
 
 declare global {
 	interface Window {
@@ -45,22 +54,15 @@ async function createDraftAndOpenEditor(
 	page: import('@playwright/test').Page,
 	title: string,
 ) {
-	await page.goto('/wiki');
+	await page.goto(APP_BASE);
 	await page.waitForLoadState('networkidle');
 
-	const spaceLink = page.locator('a[href*="/wiki/spaces/"]').first();
+	const spaceLink = page.locator(spaceLinkSelector()).first();
 	await expect(spaceLink).toBeVisible({ timeout: 5000 });
 	await spaceLink.click();
 	await page.waitForLoadState('networkidle');
 
-	const createFirstPage = page.locator('button:has-text("Create First Page")');
-	const newPageButton = page.locator('button[title="New Page"]');
-
-	if (await createFirstPage.isVisible({ timeout: 2000 }).catch(() => false)) {
-		await createFirstPage.click();
-	} else {
-		await newPageButton.click();
-	}
+	await openNewPageDialog(page);
 
 	await page.getByLabel('Title').fill(title);
 	await page.getByRole('dialog').getByRole('button', { name: 'Save' }).click();
@@ -144,6 +146,74 @@ test.describe('Iframe embed extension', () => {
 		expect(md2).toBe(md1);
 	});
 
+	/**
+	 * Fire a real `paste` ClipboardEvent at the ProseMirror node so the editor's
+	 * own handlePaste runs — the path a user's Cmd+V takes. A URL copied from
+	 * the browser's address bar carries text/plain and nothing else, which is
+	 * also the shape that makes handlePaste treat the payload as markdown.
+	 */
+	async function pasteText(
+		page: import('@playwright/test').Page,
+		text: string,
+	) {
+		await page.evaluate((text) => {
+			const dom = document.querySelector('.ProseMirror') as HTMLElement | null;
+			if (!dom) throw new Error('editor not found');
+			dom.focus();
+			const dt = new DataTransfer();
+			dt.setData('text/plain', text);
+			dom.dispatchEvent(
+				new ClipboardEvent('paste', {
+					clipboardData: dt,
+					bubbles: true,
+					cancelable: true,
+				}),
+			);
+		}, text);
+	}
+
+	test('turns a pasted YouTube link into an embed', async ({ page }) => {
+		await createDraftAndOpenEditor(page, `iframe-paste-${Date.now()}`);
+
+		await pasteText(page, 'https://www.youtube.com/watch?v=QDia3e12czc');
+
+		await expect
+			.poll(
+				() =>
+					page.evaluate(() => {
+						const block = window.wikiEditor
+							.getJSON()
+							.content?.find((n) => n.type === 'iframeBlock');
+						return (block?.attrs?.src as string) ?? null;
+					}),
+				{ timeout: 5000 },
+			)
+			.toBe('https://www.youtube-nocookie.com/embed/QDia3e12czc');
+	});
+
+	// A URL sitting inside a sentence is a link, not a video. Only a paste whose
+	// entire payload is the URL should embed.
+	test('leaves a pasted sentence containing a link as text', async ({
+		page,
+	}) => {
+		await createDraftAndOpenEditor(page, `iframe-paste-inline-${Date.now()}`);
+
+		await pasteText(
+			page,
+			'watch https://www.youtube.com/watch?v=QDia3e12czc later',
+		);
+
+		await page.waitForTimeout(500);
+		const hasBlock = await page.evaluate(() =>
+			Boolean(
+				window.wikiEditor
+					.getJSON()
+					.content?.some((n) => n.type === 'iframeBlock'),
+			),
+		);
+		expect(hasBlock).toBe(false);
+	});
+
 	test('accepts the full iframe tag in the /embed URL input', async ({
 		page,
 	}) => {
@@ -170,14 +240,14 @@ test.describe('Iframe embed extension', () => {
 			.click();
 
 		const preview = page.locator(
-			'.iframe-block-wrapper iframe[src*="youtube.com/embed"]',
+			'.iframe-block-wrapper iframe[src*="youtube-nocookie.com/embed"]',
 		);
 		await expect(preview).toBeVisible({ timeout: 5000 });
-		await expect(preview).toHaveAttribute('src', IFRAME_SRC);
+		await expect(preview).toHaveAttribute('src', IFRAME_SRC_NORMALIZED);
 
 		// Saved markdown reflects the attrs pulled from the pasted iframe HTML.
 		const md = await page.evaluate(() => window.wikiEditor.getMarkdown());
-		expect(md).toContain(`src="${IFRAME_SRC}"`);
+		expect(md).toContain(`src="${IFRAME_SRC_NORMALIZED}"`);
 		expect(md).toContain('title="YouTube video player"');
 	});
 });

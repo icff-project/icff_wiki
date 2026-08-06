@@ -1,5 +1,15 @@
 import { expect, test } from '@playwright/test';
 import { getList } from '../helpers/frappe';
+import {
+	APP_BASE,
+	CHANGE_REQUEST_URL_RE,
+	spaceLinkSelector,
+} from '../helpers/routes';
+import {
+	clickSidebarAddOption,
+	openNewPageDialog,
+	publishChangeRequestFromReview,
+} from '../helpers/wiki';
 
 interface WikiDocumentRoute {
 	route: string;
@@ -31,26 +41,18 @@ test.describe('TOC Navigation', () => {
 		await page.setViewportSize({ width: 1100, height: 900 });
 
 		// Navigate to wiki and click first space
-		await page.goto('/wiki');
+		await page.goto(APP_BASE);
 		await page.waitForLoadState('networkidle');
 
-		const spaceLink = page.locator('a[href*="/wiki/spaces/"]').first();
+		const spaceLink = page.locator(spaceLinkSelector()).first();
 		await expect(spaceLink).toBeVisible({ timeout: 5000 });
 		await spaceLink.click();
 		await page.waitForLoadState('networkidle');
 
 		// Create first page with specific headings
 		const firstPageTitle = `toc-nav-first-${Date.now()}`;
-		const createFirstPage = page.locator(
-			'button:has-text("Create First Page")',
-		);
-		const newPageButton = page.locator('button[title="New Page"]');
 
-		if (await createFirstPage.isVisible({ timeout: 2000 }).catch(() => false)) {
-			await createFirstPage.click();
-		} else {
-			await newPageButton.click();
-		}
+		await openNewPageDialog(page);
 
 		await page.getByLabel('Title').fill(firstPageTitle);
 		await page
@@ -105,7 +107,7 @@ Beta sub content.`;
 
 		// Create second page with different headings
 		const secondPageTitle = `toc-nav-second-${Date.now()}`;
-		await page.locator('button[title="New Page"]').click();
+		await clickSidebarAddOption(page, 'New Page');
 		await page.getByLabel('Title').fill(secondPageTitle);
 		await page
 			.getByRole('dialog')
@@ -161,16 +163,10 @@ Epsilon content here.`;
 		// Submit and merge both pages
 		await page.getByRole('button', { name: 'Submit for Review' }).click();
 		await page.getByRole('button', { name: 'Submit' }).click();
-		await expect(page).toHaveURL(/\/wiki\/change-requests\//, {
+		await expect(page).toHaveURL(CHANGE_REQUEST_URL_RE, {
 			timeout: 10000,
 		});
-		// Handle both "Merge" and "Resolve & Merge" buttons (conflicts may auto-resolve)
-		const mergeButton = page.getByRole('button', { name: /Merge/ });
-		await expect(mergeButton).toBeVisible({ timeout: 10000 });
-		await mergeButton.click();
-		await expect(
-			page.locator('text=Change request merged').first(),
-		).toBeVisible({ timeout: 15000 });
+		await publishChangeRequestFromReview(page);
 
 		// Open public view for the first page
 		const routes = await getList<WikiDocumentRoute>(request, 'Wiki Document', {

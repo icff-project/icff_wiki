@@ -1,12 +1,18 @@
 <template>
     <div class="wiki-editor-container">
-        <div v-if="editor">
-            <WikiToolbar :editor="editor" @uploadImage="handleImageUpload" />
-            <WikiBubbleMenu :editor="editor" />
-            <EditorContent :editor="editor" />
-        </div>
-        <div v-else class="wiki-editor-loading">
-            Loading editor...
+        <div>
+            <WikiToolbar v-if="!readonly" :editor="editor" @uploadImage="handleImageUpload" />
+            <div class="w-full max-w-[770px] px-6">
+                <slot name="title" />
+                <EditorContent :editor="editor" :class="contentClass" />
+            </div>
+            <!-- After EditorContent so the ProseMirror DOM is attached when the
+                 bubble menu mounts; it derives its flip boundary from the editor's
+                 scroll ancestor, which must be reachable at that point. -->
+            <WikiBubbleMenu v-if="!readonly" :editor="editor" />
+            <!-- Floating row/column/cell controls shown while the selection is
+                 inside a table; replaces the old WikiTableDropdown actions. -->
+            <EditorTableMenu v-if="!readonly" :editor="editor" />
         </div>
 
         <!-- Hidden file input for slash command image upload -->
@@ -22,7 +28,6 @@
 </template>
 
 <script setup>
-import { Extension } from '@tiptap/core';
 import { TaskItem, TaskList } from '@tiptap/extension-list';
 import { Paragraph } from '@tiptap/extension-paragraph';
 import {
@@ -32,15 +37,26 @@ import {
 	TableRow,
 } from '@tiptap/extension-table';
 import { Placeholder } from '@tiptap/extensions';
-import { Markdown } from '@tiptap/markdown';
-import { StarterKit } from '@tiptap/starter-kit';
-import { Editor, EditorContent } from '@tiptap/vue-3';
 import { onKeyStroke } from '@vueuse/core';
 import { toast, useFileUpload } from 'frappe-ui';
-import { common, createLowlight } from 'lowlight';
-import { createApp, h, onMounted, onUnmounted, ref, watch } from 'vue';
-import { WikiCodeBlock } from './tiptap-extensions/code-block-extension.js';
+import {
+	createApp,
+	h,
+	onBeforeUnmount,
+	onMounted,
+	onUnmounted,
+	ref,
+	shallowRef,
+	watch,
+} from 'vue';
 
+import {
+	CodeBlock,
+	EditorContent,
+	EditorTableMenu,
+	Markdown,
+	useEditor,
+} from 'frappe-ui/editor';
 import LinkPopup from './tiptap-extensions/LinkPopup.vue';
 import SlashCommandsList from './tiptap-extensions/SlashCommandsList.vue';
 import WikiBubbleMenu from './tiptap-extensions/WikiBubbleMenu.vue';
@@ -48,30 +64,24 @@ import WikiToolbar from './tiptap-extensions/WikiToolbar.vue';
 // Import custom extensions
 import { CalloutBlock } from './tiptap-extensions/callout-block.js';
 import { IframeBlock } from './tiptap-extensions/iframe-block.js';
+import { isEmbedUrlPaste } from './tiptap-extensions/iframe-embed.js';
 import { WikiImage } from './tiptap-extensions/image-extension.js';
 import { WikiLink } from './tiptap-extensions/link-extension.js';
+import { canonicalizeMarkdown } from './tiptap-extensions/markdown-normalize.js';
+import { MermaidBlock } from './tiptap-extensions/mermaid-block.js';
 import { PdfBlock } from './tiptap-extensions/pdf-block.js';
+import { PreserveBlankLines } from './tiptap-extensions/preserve-blank-lines.js';
 import {
+	SLASH_COMMANDS,
 	SlashCommands,
 	filterCommands,
 } from './tiptap-extensions/slash-commands.js';
 import { VideoBlock } from './tiptap-extensions/video-block.js';
+import { wikiStarterKit } from './tiptap-extensions/wiki-starterkit.js';
 
 // Import tippy for slash command popup
 import tippy from 'tippy.js';
 import 'tippy.js/dist/tippy.css';
-
-// Preserve consecutive blank lines in markdown round-trips.
-// Parse: marked's 'space' tokens (ignored by default) become empty paragraphs.
-const PreserveBlankLines = Extension.create({
-	name: 'preserveBlankLines',
-	markdownTokenName: 'space',
-	parseMarkdown(token) {
-		const count = Math.floor(token.raw.length / 2) - 1;
-		if (count <= 0) return null;
-		return Array.from({ length: count }, () => ({ type: 'paragraph' }));
-	},
-});
 
 // Serialize: empty paragraphs render as blank lines instead of &nbsp;.
 const WikiParagraph = Paragraph.extend({
@@ -99,21 +109,27 @@ const props = defineProps({
 		type: String,
 		default: '',
 	},
+	// Render the document for reading only: no toolbar/bubble menu, the
+	// ProseMirror view is non-editable, and every save path short-circuits.
+	// Used for git-synced spaces whose content is owned by the repo.
+	readonly: {
+		type: Boolean,
+		default: false,
+	},
 });
 
-const emit = defineEmits(['save', 'content-change', 'content-ready']);
+const emit = defineEmits([
+	'save',
+	'save-all',
+	'content-change',
+	'content-ready',
+]);
 
 const AUTOSAVE_DELAY = 10 * 1000;
 let autosaveTimer = null;
 
-// Create lowlight instance for syntax highlighting
-const lowlight = createLowlight(common);
-
 // File upload composable from frappe-ui
 const fileUploader = useFileUpload();
-
-// Editor instance
-const editor = ref(null);
 
 // Refs for file input and link popup
 const slashImageInput = ref(null);
@@ -195,10 +211,7 @@ async function insertAndUploadImage(file) {
 		preview = '';
 	}
 
-	ed.chain()
-		.focus()
-		.setImage({ src: preview, uploadId, loading: true })
-		.run();
+	ed.chain().focus().setImage({ src: preview, uploadId, loading: true }).run();
 
 	try {
 		const url = await uploadFile(file);
@@ -285,6 +298,15 @@ function handlePaste(_view, event) {
 	// default handler keep the rich formatting.
 	const text = event.clipboardData?.getData('text/plain');
 	const html = event.clipboardData?.getData('text/html');
+
+	// A paste that is nothing but an embeddable URL belongs to the iframe
+	// block's paste rule. Handling it as markdown here would consume the event
+	// (returning true stops ProseMirror applying its slice, and with it every
+	// paste rule) and leave a bare link where the video should be.
+	if (text && isEmbedUrlPaste(text)) {
+		return false;
+	}
+
 	if (text && !html && editor.value?.markdown) {
 		event.preventDefault();
 		editor.value
@@ -439,6 +461,10 @@ function hideLinkPopup() {
 function createSlashCommandsSuggestion() {
 	return {
 		items: ({ query }) => filterCommands(query),
+		// Suggestion dispatches onStart with `initialItems` and only delivers the
+		// real list in a follow-up onUpdate; without this the menu opens on a bare
+		// "/" showing "No commands found" until the first character is typed.
+		initialItems: SLASH_COMMANDS,
 		render: () => {
 			let component;
 			let popup;
@@ -458,16 +484,15 @@ function createSlashCommandsSuggestion() {
 						app: null,
 					};
 
-					// Mount the SlashCommandsList component directly
-					import('vue').then(({ createApp }) => {
-						if (isDestroyed) return;
-						const app = createApp(SlashCommandsList, {
-							items: props.items,
-							command: props.command,
-						});
-						component.app = app;
-						component.vm = app.mount(container);
+					// Mount synchronously: onUpdate fires right after onStart with the
+					// fetched items, and it skips re-rendering while `component.app` is
+					// null — an async mount here would swallow that first update.
+					const app = createApp(SlashCommandsList, {
+						items: props.items,
+						command: props.command,
 					});
+					component.app = app;
+					component.vm = app.mount(container);
 
 					// Create tippy popup with no default styling
 					popup = tippy('body', {
@@ -482,6 +507,23 @@ function createSlashCommandsSuggestion() {
 						theme: 'none',
 						arrow: false,
 						offset: [0, 4],
+						// Flip above the caret when there's no room below (e.g. the
+						// on-screen keyboard covers the lower viewport on mobile), and
+						// keep the menu within the viewport. Mirrors the bubble menu.
+						popperOptions: {
+							modifiers: [
+								{
+									name: 'flip',
+									options: {
+										fallbackPlacements: ['top-start', 'bottom-start'],
+									},
+								},
+								{
+									name: 'preventOverflow',
+									options: { boundary: 'viewport', padding: 8 },
+								},
+							],
+						},
 					})[0];
 				},
 
@@ -490,19 +532,13 @@ function createSlashCommandsSuggestion() {
 
 					// Re-render with new items
 					if (component?.app) {
-						import('vue').then(({ createApp }) => {
-							if (isDestroyed) return;
-							// Unmount old app
-							component.app.unmount();
-							const container = component.element;
-							// Create new app with updated props
-							const app = createApp(SlashCommandsList, {
-								items: props.items,
-								command: props.command,
-							});
-							component.app = app;
-							component.vm = app.mount(container);
+						component.app.unmount();
+						const app = createApp(SlashCommandsList, {
+							items: props.items,
+							command: props.command,
 						});
+						component.app = app;
+						component.vm = app.mount(component.element);
 					}
 
 					if (popup) {
@@ -548,93 +584,95 @@ function createSlashCommandsSuggestion() {
 	};
 }
 
-/**
- * Initialize the editor
- */
-function initEditor() {
-	editor.value = new Editor({
-		extensions: [
-			StarterKit.configure({
-				codeBlock: false, // We use CodeBlockLowlight instead
-				link: false, // We use our custom WikiLink
-				paragraph: false, // We use WikiParagraph for blank line support
-			}),
-			WikiParagraph,
-			// Custom link extension with Cmd+K support
-			WikiLink.configure({
-				openOnClick: false,
-				HTMLAttributes: {
-					rel: 'noopener noreferrer',
-				},
-				onOpenLinkEditor: showLinkPopup,
-			}),
-			Markdown.configure({
-				markedOptions: {
-					breaks: true,
-				},
-			}),
-			PreserveBlankLines,
-			// Custom image extension with caption support
-			WikiImage.configure({
-				inline: false,
-				allowBase64: true,
-			}),
-			Table.configure({
-				resizable: true,
-			}),
-			TableRow,
-			TableCell,
-			TableHeader,
-			TaskList,
-			TaskItem.configure({
-				nested: true,
-			}),
-			Placeholder.configure({
-				placeholder: 'Type "/" for commands, or start writing...',
-			}),
-			WikiCodeBlock.configure({
-				lowlight,
-			}),
-			// Custom extensions
-			CalloutBlock,
-			IframeBlock,
-			PdfBlock,
-			VideoBlock.configure({
-				uploadFunction: uploadFile,
-			}),
-			// Slash commands
-			SlashCommands.configure({
-				suggestion: createSlashCommandsSuggestion(),
-			}),
-		],
-		content: props.content || '',
-		contentType: 'markdown',
-		editorProps: {
-			handlePaste,
-			handleDrop,
-			attributes: {
-				class:
-					'prose prose-sm max-w-none prose-code:before:content-none prose-code:after:content-none prose-code:bg-transparent prose-code:p-0 prose-code:font-normal prose-table:table-fixed prose-td:p-2 prose-th:p-2 prose-td:border prose-th:border prose-td:border-outline-gray-2 prose-th:border-outline-gray-2 prose-td:relative prose-th:relative prose-th:bg-surface-gray-2 prose-a:underline prose-a:[text-underline-offset:2px] prose-a:[word-break:break-all] hover:prose-a:text-ink-gray-7 wiki-editor-content',
-			},
-		},
-		onUpdate: () => {
-			handleContentChange();
-		},
-	});
+// Final flush of unsaved work. Registered before useEditor() on purpose:
+// both hook onBeforeUnmount, they run in registration order, and useEditor's
+// hook destroys the editor — this one must read it while it's still alive.
+onBeforeUnmount(() => {
+	if (autosaveTimer) {
+		clearTimeout(autosaveTimer);
+		autosaveTimer = null;
+	}
+	emitContentChange({ persistImmediately: true });
+});
 
-	emitContentReady();
-}
+// Seeds the editor and receives serialized markdown on every update; the
+// save flow reads normalized markdown from the editor directly instead.
+const editorContent = shallowRef(props.content || '');
+
+const editor = useEditor({
+	content: editorContent,
+	format: 'markdown',
+	editable: () => !props.readonly,
+	extensions: [
+		wikiStarterKit({ paragraph: false }),
+		WikiParagraph,
+		// Custom link extension with Cmd+K support
+		WikiLink.configure({
+			openOnClick: false,
+			HTMLAttributes: {
+				rel: 'noopener noreferrer',
+			},
+			onOpenLinkEditor: showLinkPopup,
+		}),
+		Markdown.configure({
+			markedOptions: {
+				breaks: true,
+			},
+		}),
+		PreserveBlankLines,
+		// Custom image extension with caption support
+		WikiImage.configure({
+			inline: false,
+			allowBase64: true,
+		}),
+		Table.configure({
+			resizable: true,
+			renderWrapper: true,
+		}),
+		TableRow,
+		TableCell,
+		TableHeader,
+		TaskList,
+		TaskItem.configure({
+			nested: true,
+		}),
+		Placeholder.configure({
+			placeholder: 'Type "/" for commands, or start writing...',
+		}),
+		CodeBlock,
+		// Custom extensions
+		CalloutBlock,
+		IframeBlock,
+		MermaidBlock,
+		PdfBlock,
+		VideoBlock.configure({
+			uploadFunction: uploadFile,
+		}),
+		// Slash commands
+		SlashCommands.configure({
+			suggestion: createSlashCommandsSuggestion(),
+		}),
+	],
+	onUpdate: handleContentChange,
+});
+
+// useEditor doesn't take editorProps; set them on the created instance.
+editor.value.setOptions({
+	editorProps: {
+		handlePaste,
+		handleDrop,
+	},
+});
+
+// Typography comes from EditorContent's own `prose prose-v3` defaults; these
+// classes only hook wiki-specific rules in wiki-editor-content.css.
+const contentClass = [
+	'wiki-editor-content',
+	props.readonly ? '' : 'is-editable',
+];
 
 function normalizeMarkdown(content) {
-	const markdown = content ?? '';
-	const manager = editor.value?.markdown;
-	if (!manager) return markdown;
-	try {
-		return manager.serialize(manager.parse(markdown));
-	} catch (error) {
-		console.warn('[WikiEditor] Could not normalize markdown', error);
-		return markdown;
-	}
+	return canonicalizeMarkdown(editor.value?.markdown, content);
 }
 
 function getMarkdown() {
@@ -695,6 +733,8 @@ async function autoSave() {
 }
 
 function saveToDB() {
+	// Read-only documents (git-synced spaces) never write back.
+	if (props.readonly) return;
 	// Clear any pending autosave
 	if (autosaveTimer) {
 		clearTimeout(autosaveTimer);
@@ -716,6 +756,8 @@ function saveToDB() {
 		if (markdown !== normalizeMarkdown(props.savedContent)) {
 			emit('save', markdown);
 		}
+		// "Save" means all of the user's work, not just this page.
+		emit('save-all');
 		document.dispatchEvent(new CustomEvent('wiki-editor-after-save'));
 	} else {
 		toast.error('Could not get content from editor');
@@ -735,6 +777,7 @@ defineExpose({
 
 // Keyboard shortcut: Cmd+S / Ctrl+S to save
 onKeyStroke('s', (e) => {
+	if (props.readonly) return;
 	if (e.metaKey || e.ctrlKey) {
 		e.preventDefault();
 		saveToDB();
@@ -742,7 +785,7 @@ onKeyStroke('s', (e) => {
 });
 
 onMounted(() => {
-	initEditor();
+	emitContentReady();
 	// Expose editor on window for E2E testing
 	window.wikiEditor = editor.value;
 	// Listen for slash command image upload events
@@ -765,419 +808,6 @@ onUnmounted(() => {
 	hideLinkPopup();
 	// Clean up window reference
 	delete window.wikiEditor;
-
-	if (autosaveTimer) {
-		clearTimeout(autosaveTimer);
-	}
-	emitContentChange({ persistImmediately: true });
-	if (editor.value) {
-		editor.value.destroy();
-	}
 });
 </script>
 
-<style>
-/* Tippy theme override for slash commands */
-.tippy-box[data-theme~='none'] {
-    background: transparent;
-    border: none;
-    box-shadow: none;
-}
-
-.tippy-box[data-theme~='none'] > .tippy-content {
-    padding: 0;
-}
-
-/* Hidden file input */
-.hidden-file-input {
-    display: none;
-}
-
-/* Wiki Editor Container Styles */
-.wiki-editor-container {
-    display: flex;
-    flex-direction: column;
-    height: 100%;
-    isolation: isolate; /* Create new stacking context to contain z-index */
-}
-
-.wiki-editor-loading {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    min-height: 300px;
-    color: var(--ink-gray-5, #6b7280);
-}
-
-/* TipTap Editor Wrapper */
-.wiki-tiptap-editor {
-    flex: 1;
-    min-height: 500px;
-    background-color: var(--surface-white, #ffffff);
-    position: relative;
-    margin-top: 1rem;
-    max-width: 100ch;
-    width: 100%;
-    margin-left: auto;
-    margin-right: auto;
-}
-
-/* Editor Content Styles */
-.wiki-editor-content {
-    min-height: 480px;
-    padding: 1.5rem;
-    outline: none;
-    font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    font-size: 1rem;
-    line-height: 1.625;
-    color: var(--ink-gray-9, #111827);
-    border: 1px solid var(--outline-gray-2, #e5e7eb);
-    border-radius: 0 0 0.5rem 0.5rem;
-}
-
-.wiki-editor-content:focus {
-    outline: none;
-}
-
-/* Code block styling - Light theme */
-.wiki-editor-content pre {
-    background-color: var(--surface-gray-1, #f9fafb);
-    border: 1px solid var(--outline-gray-2, #e5e7eb);
-    color: var(--ink-gray-9, #111827);
-    border-radius: 0.5rem;
-    padding: 1rem 1.25rem;
-    overflow-x: auto;
-    font-size: 0.875rem;
-    line-height: 1.6;
-    font-family: 'Fira Code', 'JetBrains Mono', 'SF Mono', Menlo, Monaco, 'Courier New', monospace;
-    margin: 1rem 0;
-    caret-color: var(--ink-gray-9, #111827);
-}
-
-.wiki-editor-content pre code {
-    background: none;
-    padding: 0;
-    font-size: inherit;
-    color: inherit;
-    caret-color: var(--ink-gray-9, #111827);
-}
-
-/* Inline code styling */
-.wiki-editor-content code {
-    background-color: var(--surface-gray-2, #f3f4f6);
-    padding: 0.125rem 0.375rem;
-    border-radius: 0.25rem;
-    font-size: 0.875em;
-    font-family: 'Fira Code', 'JetBrains Mono', 'SF Mono', Menlo, Monaco, 'Courier New', monospace;
-}
-
-/* Blockquote styling */
-.wiki-editor-content blockquote {
-    border-left: 3px solid var(--outline-gray-3, #d1d5db);
-    padding-left: 1rem;
-    margin: 1rem 0;
-    color: var(--ink-gray-6, #4b5563);
-    font-style: italic;
-}
-
-/* Table styling */
-.wiki-editor-content table {
-    width: 100%;
-    border-collapse: collapse;
-    margin: 1rem 0;
-    table-layout: fixed;
-}
-
-.wiki-editor-content th,
-.wiki-editor-content td {
-    border: 1px solid var(--outline-gray-2, #e5e7eb);
-    padding: 0.5rem 0.75rem;
-    text-align: left;
-    position: relative;
-    vertical-align: top;
-    min-width: 80px;
-}
-
-.wiki-editor-content th {
-    background-color: var(--surface-gray-1, #f9fafb);
-    font-weight: 600;
-}
-
-/* Table cell selection */
-.wiki-editor-content .selectedCell::after {
-    content: '';
-    position: absolute;
-    left: 0;
-    right: 0;
-    top: 0;
-    bottom: 0;
-    background: rgba(59, 130, 246, 0.15);
-    pointer-events: none;
-    z-index: 1;
-}
-
-/* Table column resize handle */
-.wiki-editor-content .column-resize-handle {
-    position: absolute;
-    right: -2px;
-    top: 0;
-    bottom: 0;
-    width: 4px;
-    background-color: #3b82f6;
-    cursor: col-resize;
-    z-index: 10;
-}
-
-/* Table resize cursor */
-.wiki-editor-content.resize-cursor {
-    cursor: col-resize;
-}
-
-/* Horizontal rule */
-.wiki-editor-content hr {
-    border: none;
-    border-top: 1px solid var(--outline-gray-2, #e5e7eb);
-    margin: 1.5rem 0;
-}
-
-/* Image styling */
-.wiki-editor-content img {
-    max-width: 100%;
-    height: auto;
-    border: 1px solid var(--ink-gray-3);
-    border-radius: 0.375rem;
-}
-
-/* Image caption styling using img + em pattern
-   Usage in markdown:
-   ![alt text](image.jpg)
-   *caption text*
-   (no blank line between image and caption)
-*/
-.wiki-editor-content img:has(+ em) {
-    margin-bottom: 0;
-}
-
-.wiki-editor-content img + em {
-    display: block;
-    margin-top: 0.25rem;
-    font-size: 0.875rem;
-    color: var(--ink-gray-6, #4b5563);
-    text-align: center;
-}
-
-/* Selected node */
-.wiki-editor-content .ProseMirror-selectednode {
-    outline: 2px solid var(--primary, #171717);
-    outline-offset: 2px;
-}
-
-/* Syntax highlighting - GitHub Light inspired theme */
-.wiki-editor-content .hljs-comment,
-.wiki-editor-content .hljs-quote {
-    color: #6a737d;
-    font-style: italic;
-}
-
-.wiki-editor-content .hljs-keyword,
-.wiki-editor-content .hljs-selector-tag {
-    color: #d73a49;
-}
-
-.wiki-editor-content .hljs-deletion {
-    color: #b31d28;
-    background-color: #ffeef0;
-}
-
-.wiki-editor-content .hljs-string,
-.wiki-editor-content .hljs-doctag {
-    color: #032f62;
-}
-
-.wiki-editor-content .hljs-addition {
-    color: #22863a;
-    background-color: #f0fff4;
-}
-
-.wiki-editor-content .hljs-number,
-.wiki-editor-content .hljs-literal {
-    color: #005cc5;
-}
-
-.wiki-editor-content .hljs-symbol,
-.wiki-editor-content .hljs-bullet {
-    color: #e36209;
-}
-
-.wiki-editor-content .hljs-function {
-    color: #6f42c1;
-}
-
-.wiki-editor-content .hljs-title {
-    color: #6f42c1;
-    font-weight: 600;
-}
-
-.wiki-editor-content .hljs-built_in {
-    color: #005cc5;
-}
-
-.wiki-editor-content .hljs-class .hljs-title,
-.wiki-editor-content .hljs-type {
-    color: #22863a;
-}
-
-.wiki-editor-content .hljs-attr {
-    color: #005cc5;
-}
-
-.wiki-editor-content .hljs-variable,
-.wiki-editor-content .hljs-template-variable {
-    color: #e36209;
-}
-
-.wiki-editor-content .hljs-name {
-    color: #22863a;
-}
-
-.wiki-editor-content .hljs-selector-id,
-.wiki-editor-content .hljs-selector-class {
-    color: #6f42c1;
-}
-
-.wiki-editor-content .hljs-regexp {
-    color: #032f62;
-}
-
-.wiki-editor-content .hljs-link {
-    color: #005cc5;
-    text-decoration: underline;
-}
-
-.wiki-editor-content .hljs-meta {
-    color: #6a737d;
-}
-
-.wiki-editor-content .hljs-operator {
-    color: #d73a49;
-}
-
-.wiki-editor-content .hljs-punctuation {
-    color: #24292e;
-}
-
-.wiki-editor-content .hljs-emphasis {
-    font-style: italic;
-}
-
-.wiki-editor-content .hljs-strong {
-    font-weight: bold;
-}
-
-.wiki-editor-content .hljs-params {
-    color: #24292e;
-}
-
-.wiki-editor-content .hljs-property {
-    color: #005cc5;
-}
-
-/* Syntax highlighting - Dark theme overrides (matches public page theme) */
-[data-theme="dark"] .wiki-editor-content .hljs-comment,
-[data-theme="dark"] .wiki-editor-content .hljs-quote {
-    color: #8b949e;
-}
-
-[data-theme="dark"] .wiki-editor-content .hljs-keyword,
-[data-theme="dark"] .wiki-editor-content .hljs-selector-tag {
-    color: #ff7b72;
-}
-
-[data-theme="dark"] .wiki-editor-content .hljs-deletion {
-    color: #ffa198;
-    background-color: rgba(248, 81, 73, 0.15);
-}
-
-[data-theme="dark"] .wiki-editor-content .hljs-string,
-[data-theme="dark"] .wiki-editor-content .hljs-doctag {
-    color: #a5d6ff;
-}
-
-[data-theme="dark"] .wiki-editor-content .hljs-addition {
-    color: #7ee787;
-    background-color: rgba(46, 160, 67, 0.15);
-}
-
-[data-theme="dark"] .wiki-editor-content .hljs-number,
-[data-theme="dark"] .wiki-editor-content .hljs-literal {
-    color: #79c0ff;
-}
-
-[data-theme="dark"] .wiki-editor-content .hljs-symbol,
-[data-theme="dark"] .wiki-editor-content .hljs-bullet {
-    color: #ffa657;
-}
-
-[data-theme="dark"] .wiki-editor-content .hljs-function {
-    color: #d2a8ff;
-}
-
-[data-theme="dark"] .wiki-editor-content .hljs-title {
-    color: #d2a8ff;
-}
-
-[data-theme="dark"] .wiki-editor-content .hljs-built_in {
-    color: #79c0ff;
-}
-
-[data-theme="dark"] .wiki-editor-content .hljs-class .hljs-title,
-[data-theme="dark"] .wiki-editor-content .hljs-type {
-    color: #7ee787;
-}
-
-[data-theme="dark"] .wiki-editor-content .hljs-attr {
-    color: #79c0ff;
-}
-
-[data-theme="dark"] .wiki-editor-content .hljs-variable,
-[data-theme="dark"] .wiki-editor-content .hljs-template-variable {
-    color: #ffa657;
-}
-
-[data-theme="dark"] .wiki-editor-content .hljs-name {
-    color: #7ee787;
-}
-
-[data-theme="dark"] .wiki-editor-content .hljs-selector-id,
-[data-theme="dark"] .wiki-editor-content .hljs-selector-class {
-    color: #d2a8ff;
-}
-
-[data-theme="dark"] .wiki-editor-content .hljs-regexp {
-    color: #a5d6ff;
-}
-
-[data-theme="dark"] .wiki-editor-content .hljs-link {
-    color: #79c0ff;
-}
-
-[data-theme="dark"] .wiki-editor-content .hljs-meta {
-    color: #8b949e;
-}
-
-[data-theme="dark"] .wiki-editor-content .hljs-operator {
-    color: #ff7b72;
-}
-
-[data-theme="dark"] .wiki-editor-content .hljs-punctuation {
-    color: #c9d1d9;
-}
-
-[data-theme="dark"] .wiki-editor-content .hljs-params {
-    color: #c9d1d9;
-}
-
-[data-theme="dark"] .wiki-editor-content .hljs-property {
-    color: #79c0ff;
-}
-</style>
